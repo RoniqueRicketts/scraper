@@ -1,0 +1,31 @@
+{
+  "name": "scraper",
+  "version": "1.0.0",
+  "description": "scrape websites of product details",
+  "homepage": "https://github.com/RoniqueRicketts/scraper#readme",
+  "bugs": {
+    "url": "https://github.com/RoniqueRicketts/scraper/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RoniqueRicketts/scraper.git"
+  },
+  "license": "ISC",
+  "author": "ronique ricketts",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/app.ts",
+    "scrape": "node src/cli.ts"
+  },
+  "dependencies": {
+    "axios": "^1.20.0",
+    "cheerio": "^1.2.0",
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}
