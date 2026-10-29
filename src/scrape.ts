@@ -8,6 +8,25 @@ const USER_AGENT =
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_CATEGORY_URL = 'https://virtualmartja.com/shop?category=ps-groceries-g10d03';
+const MIN_REQUEST_INTERVAL_MS = 3_000;
+const REQUEST_TIMEOUT_MS = 120_000;
+const MAX_RETRIES = 5;
+const BASE_RETRY_DELAY_MS = 5_000;
+const MAX_RETRY_DELAY_MS = 5 * 60_000;
+const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const RETRYABLE_ERROR_CODES = new Set([
+	'ECONNABORTED',
+	'ECONNREFUSED',
+	'ECONNRESET',
+	'EAI_AGAIN',
+	'EPIPE',
+	'ERR_CANCELED',
+	'ERR_NETWORK',
+	'ETIMEDOUT',
+]);
+
+let requestQueue: Promise<void> = Promise.resolve();
+let lastRequestAt = 0;
 
 type JsonObject = Record<string, unknown>;
 
@@ -28,15 +47,30 @@ interface SavedProduct extends ProductRecord {
 	imageFiles: string[];
 }
 
+export interface ScrapeProgress {
+	phase: 'category' | 'products';
+	done: number;
+	total?: number;
+	failed: number;
+}
+
 export interface ScrapeOptions {
 	productLimit?: number;
 	concurrency?: number;
+	onProgress?: (progress: ScrapeProgress) => void;
+}
+
+export interface FailedProduct {
+	url: string;
+	error: string;
 }
 
 export interface ScrapeResult {
 	productCount: number;
 	imageCount: number;
+	failedCount: number;
 	csvPath: string;
+	failedCsvPath?: string;
 	outputDirectory: string;
 }
 
@@ -197,6 +231,86 @@ function csvCell(value: string): string {
 	return `"${value.replace(/"/g, '""')}"`;
 }
 
+function wait(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function getRetryAfterMs(error: unknown): number | undefined {
+	if (!axios.isAxiosError(error) || !error.response) {
+		return undefined;
+	}
+
+	const header = error.response.headers['retry-after'];
+	const retryAfter = Array.isArray(header) ? header[0] : header;
+	if (typeof retryAfter !== 'string') {
+		return undefined;
+	}
+
+	const seconds = Number(retryAfter);
+	if (Number.isFinite(seconds) && seconds >= 0) {
+		return seconds * 1_000;
+	}
+	const retryAt = Date.parse(retryAfter);
+	return Number.isNaN(retryAt) ? undefined : Math.max(0, retryAt - Date.now());
+}
+
+function isRetryable(error: unknown): boolean {
+	if (!axios.isAxiosError(error)) {
+		return false;
+	}
+	if (error.response) {
+		return RETRYABLE_STATUSES.has(error.response.status);
+	}
+	return error.code !== undefined && RETRYABLE_ERROR_CODES.has(error.code);
+}
+
+// Exponential backoff with full jitter, capped; a server-provided Retry-After takes precedence.
+function backoffDelayMs(error: unknown, attempt: number): number {
+	const retryAfterMs = getRetryAfterMs(error);
+	if (retryAfterMs !== undefined) {
+		return Math.min(retryAfterMs, MAX_RETRY_DELAY_MS);
+	}
+	const ceiling = Math.min(MAX_RETRY_DELAY_MS, BASE_RETRY_DELAY_MS * 2 ** attempt);
+	return ceiling / 2 + Math.random() * (ceiling / 2);
+}
+
+function describeError(error: unknown): string {
+	if (axios.isAxiosError(error)) {
+		return error.response ? `HTTP ${error.response.status}` : (error.code ?? error.message);
+	}
+	return error instanceof Error ? error.message : String(error);
+}
+
+async function pacedRequest<T>(request: () => Promise<T>, label: string): Promise<T> {
+	const result = requestQueue.then(async () => {
+		for (let attempt = 0; ; attempt++) {
+			const waitTime = Math.max(0, lastRequestAt + MIN_REQUEST_INTERVAL_MS - Date.now());
+			if (waitTime > 0) {
+				await wait(waitTime);
+			}
+			lastRequestAt = Date.now();
+
+			try {
+				return await request();
+			} catch (error) {
+				if (!isRetryable(error)) {
+					throw error;
+				}
+				if (attempt >= MAX_RETRIES) {
+					throw new Error(`${label} failed after ${MAX_RETRIES} retries (${describeError(error)}).`, { cause: error });
+				}
+				const delay = backoffDelayMs(error, attempt);
+				console.warn(
+					`${describeError(error)} for ${label}; retry ${attempt + 1}/${MAX_RETRIES} in ${Math.round(delay / 1_000)}s.`,
+				);
+				await wait(delay);
+			}
+		}
+	});
+	requestQueue = result.then(() => undefined, () => undefined);
+	return result;
+}
+
 function createCsv(products: SavedProduct[]): string {
 	const columns = [
 		'product_name',
@@ -222,7 +336,11 @@ function createCsv(products: SavedProduct[]): string {
 		product.categories,
 		product.imageFiles.join(';'),
 	]);
-	return [columns, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
+	return toCsv([columns, ...rows]);
+}
+
+function toCsv(rows: string[][]): string {
+	return rows.map((row) => row.map(csvCell).join(',')).join('\r\n') + '\r\n';
 }
 
 async function mapWithConcurrency<T, R>(
@@ -256,11 +374,13 @@ export class Scrape {
 	}
 
 	private async fetchPage(url: string): Promise<string> {
-		const response = await axios.get<string>(url, {
+		const response = await pacedRequest(() => axios.get<string>(url, {
 			headers: { 'User-Agent': USER_AGENT },
-			timeout: 30_000,
+			timeout: REQUEST_TIMEOUT_MS,
+			// `timeout` only covers socket inactivity; the signal caps the whole request, including a slow body.
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 			responseType: 'text',
-		});
+		}), url);
 		return response.data;
 	}
 
@@ -283,6 +403,7 @@ export class Scrape {
 			for (const url of result.urls) {
 				productUrls.add(url);
 			}
+			this.options.onProgress?.({ phase: 'category', done: productUrls.size, total: expectedCount, failed: 0 });
 
 			if (productUrls.size >= (this.options.productLimit ?? Number.POSITIVE_INFINITY)) {
 				break;
@@ -315,11 +436,12 @@ export class Scrape {
 		const imageFiles: string[] = [];
 
 		for (const [imageIndex, imageUrl] of product.images.entries()) {
-			const response = await axios.get<ArrayBuffer>(imageUrl, {
+			const response = await pacedRequest(() => axios.get<ArrayBuffer>(imageUrl, {
 				headers: { 'User-Agent': USER_AGENT },
 				responseType: 'arraybuffer',
-				timeout: 30_000,
-			});
+				timeout: REQUEST_TIMEOUT_MS,
+				signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			}), imageUrl);
 			const contentTypeHeader = response.headers['content-type'];
 			if (typeof contentTypeHeader !== 'string') {
 				throw new Error(`Image response from ${imageUrl} did not include a valid content type.`);
@@ -351,19 +473,40 @@ export class Scrape {
 		const outputDirectory = join(PROJECT_ROOT, 'assets', `virtualmart-groceries-${timestamp}`);
 		await mkdir(outputDirectory, { recursive: false });
 
-		const products = await mapWithConcurrency(productUrls, concurrency, async (url, index) => {
-			const html = await this.fetchPage(url);
-			const product = getProduct(html, url);
-			const imageFiles = await this.downloadImages(product, index, outputDirectory);
-			return { ...product, imageFiles };
+		const failures: FailedProduct[] = [];
+		let done = 0;
+		const results = await mapWithConcurrency(productUrls, concurrency, async (url, index) => {
+			try {
+				const html = await this.fetchPage(url);
+				const product = getProduct(html, url);
+				const imageFiles = await this.downloadImages(product, index, outputDirectory);
+				return { ...product, imageFiles };
+			} catch (error) {
+				// One bad product should not throw away the rest of a long run.
+				failures.push({ url, error: describeError(error) });
+				console.warn(`Skipping ${url}: ${describeError(error)}`);
+				return undefined;
+			} finally {
+				done += 1;
+				this.options.onProgress?.({ phase: 'products', done, total: productUrls.length, failed: failures.length });
+			}
 		});
+		const products = results.filter((product): product is SavedProduct => product !== undefined);
 
 		const csvPath = join(outputDirectory, 'products.csv');
 		await writeFile(csvPath, createCsv(products), 'utf8');
+		let failedCsvPath: string | undefined;
+		if (failures.length > 0) {
+			failedCsvPath = join(outputDirectory, 'failed.csv');
+			const rows = [['product_url', 'error'], ...failures.map((failure) => [failure.url, failure.error])];
+			await writeFile(failedCsvPath, toCsv(rows), 'utf8');
+		}
 		return {
 			productCount: products.length,
 			imageCount: products.reduce((count, product) => count + product.imageFiles.length, 0),
+			failedCount: failures.length,
 			csvPath,
+			failedCsvPath,
 			outputDirectory,
 		};
 	}
